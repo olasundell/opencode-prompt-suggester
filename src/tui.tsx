@@ -1,270 +1,167 @@
 /** @jsxImportSource @opentui/solid */
-import { readdir } from "node:fs/promises"
-import path from "node:path"
-import type { TuiPlugin, TuiPluginModule, TuiPromptRef } from "@opencode-ai/plugin/tui"
-import { loadConfig, loadLive, loadSeed, readJson, saveConfig, saveSeed } from "./infra/store.ts"
-import { PLUGIN_ID, stateRoot } from "./infra/paths.ts"
-import type { LiveSuggestion } from "./domain/suggestion.ts"
+import { Plugin } from "@opencode/plugin/tui"
+import { createEffect, createSignal, Show } from "solid-js"
+import { PromptSuggester, type SuggesterStatus } from "./rpc.ts"
+import { acceptTuiSuggestion, createTuiClient, type TuiPrompt, type TuiSnapshot, type TuiTarget } from "./tui-client.ts"
 
-type KeyLike = {
-  name?: string
-  key?: string
-  sequence?: string
-  preventDefault?: () => void
-}
+export default Plugin.define({
+  id: "opencode-prompt-suggester",
+  setup(context) {
+    const [ghost, setGhost] = createSignal<TuiSnapshot>()
+    const prompt = (context.ui as typeof context.ui & { prompt?: TuiPrompt }).prompt
+    const rpc = context.client.rpc(PromptSuggester)
+    const controller = new AbortController()
 
-const tui: TuiPlugin = async (api) => {
-  const roots = [...new Set([api.state.path.worktree, api.state.path.directory].filter(Boolean))] as string[]
-  const solid = await import("solid-js").catch(() => undefined)
-  const [ghost, setGhost] = solid?.createSignal("") ?? [() => "", (_: string) => undefined]
-  let dismissed = ""
-  let submitted = false
-  let promptRef: TuiPromptRef | undefined
-
-  const sessionID = () => {
-    const route = api.route.current
-    if (route.name === "session") return String(route.params?.sessionID ?? "") || undefined
-    return undefined
-  }
-
-  const typed = () => promptRef?.current.input ?? ""
-
-  const clearGhost = () => {
-    setGhost("")
-  }
-
-  const accept = () => {
-    const text = ghost()
-    if (!text || !promptRef) return false
-    promptRef.set({ input: text, parts: [] })
-    clearGhost()
-    return true
-  }
-
-  const refresh = async () => {
-    const id = sessionID()
-    const live = await findLive(roots, id)
-    if (submitted || !live || live.status !== "ready" || !live.text || live.text === dismissed) {
-      if (ghost()) clearGhost()
-      return
+    function current(): TuiTarget | undefined {
+      const route = context.ui.router.current()
+      if (route.type !== "session") return
+      const session = context.data.session.get(route.sessionID)
+      if (!session || session.parentID) return
+      return { sessionID: route.sessionID, location: { ...session.location } }
     }
-    if (id && live.sessionID !== id) return
-    setGhost(live.text)
-  }
 
-  api.event.on("session.idle", () => {
-    dismissed = ""
-    submitted = false
-    void refresh()
-  })
-  const poll = setInterval(() => {
-    void refresh()
-    if (ghost() && typed() === " ") accept()
-  }, 100)
-  api.lifecycle.onDispose(() => clearInterval(poll))
+    const client = createTuiClient({
+      current: () => {
+        const target = current()
+        return target && context.data.session.status(target.sessionID) !== "running" ? target : undefined
+      },
+      read: async (target, signal) => await rpc.get({ sessionID: target.sessionID }, { location: target.location, signal }) as TuiSnapshot,
+      changed: setGhost,
+    })
 
-  const isRightArrowSeq = (str: string): boolean => {
-    return (
-      str === "\x1b[C" ||
-      str === "\x1bOC" ||
-      str === "\x1b[1;5C" ||
-      str === "\x1b[1;2C" ||
-      str === "\x1b[1;3C" ||
-      str === "\x1b[1;4C" ||
-      str === "\x1b[5C" ||
-      str.includes("\x1b[C") ||
-      str.includes("\x1bOC")
-    )
-  }
-
-  const isDismissSeq = (str: string): boolean => {
-    return str === "\x7f" || str === "\x08" || str === "\x1b[3~"
-  }
-
-  if (typeof process !== "undefined" && process.stdin?.on) {
-    const onStdin = (chunk: Buffer | string) => {
-      if (typed().trim()) return
-      const str = typeof chunk === "string" ? chunk : chunk.toString("utf8")
-      if (isRightArrowSeq(str) && ghost()) {
-        accept()
-      } else if (isDismissSeq(str) && ghost()) {
-        dismissed = ghost()
-        clearGhost()
+    async function clear(target: TuiTarget, revision?: string) {
+      const resume = client.suspend(target)
+      try {
+        await rpc.clear({ sessionID: target.sessionID, ...(revision === undefined ? {} : { revision }) }, { location: target.location, signal: controller.signal })
+      } catch {
+        if (!controller.signal.aborted) context.ui.toast.show({ message: "Could not dismiss the server suggestion.", variant: "warning" })
+      } finally {
+        resume()
       }
     }
-    process.stdin.on("data", onStdin)
-    api.lifecycle.onDispose(() => {
-      process.stdin.off("data", onStdin)
-    })
-  }
 
-  const isAcceptKey = (evt: KeyLike) => {
-    const name = String(evt.name ?? "").toLowerCase()
-    const key = String(evt.key ?? "").toLowerCase()
-    const seq = String(evt.sequence ?? "")
-    return (
-      name === "space" ||
-      name === " " ||
-      name === "right" ||
-      name === "arrowright" ||
-      name === "arrow_right" ||
-      key === " " ||
-      key === "space" ||
-      key === "right" ||
-      key === "arrowright" ||
-      seq === " " ||
-      isRightArrowSeq(seq)
-    )
-  }
-
-  const isDismissKey = (evt: KeyLike) => {
-    const name = String(evt.name ?? "").toLowerCase()
-    const key = String(evt.key ?? "").toLowerCase()
-    const seq = String(evt.sequence ?? "")
-    return (
-      name === "backspace" ||
-      name === "delete" ||
-      key === "backspace" ||
-      key === "delete" ||
-      isDismissSeq(seq)
-    )
-  }
-
-  const keymap = (api as { keymap?: { intercept?: (fn: (evt: KeyLike) => unknown) => () => void } }).keymap
-  keymap?.intercept?.((evt) => {
-    if (typed()) return
-    if (isAcceptKey(evt) && ghost()) {
-      evt.preventDefault?.()
-      accept()
-      return true
+    function dismiss() {
+      const target = current()
+      const suggestion = client.visible()
+      if (!target || !suggestion || (prompt && !prompt.focused())) return false
+      client.dismiss()
+      void clear(target, suggestion.revision)
     }
-    if (isDismissKey(evt) && ghost()) {
-      evt.preventDefault?.()
-      dismissed = ghost()
-      clearGhost()
-      return true
+
+    function accept(submit: boolean) {
+      const target = current()
+      const suggestion = client.visible()
+      if (!target || !suggestion) return false
+      if (!prompt) {
+        context.ui.toast.show({
+          title: "Prompt suggester",
+          message: "This OpenCode build needs patches/tui-prompt-api.patch to insert or submit suggestions.",
+          variant: "warning",
+        })
+        return
+      }
+      if (!acceptTuiSuggestion(suggestion, target, prompt, submit)) return false
+      client.dismiss()
     }
-  })
 
-  api.slots.register({
-    order: 50,
-    slots: {
-      session_prompt(
-        _ctx: unknown,
-        props: {
-          session_id: string
-          visible?: boolean
-          disabled?: boolean
-          on_submit?: () => void
-          ref?: (ref: TuiPromptRef | undefined) => void
-        },
-      ) {
-        const text = ghost()
-        return api.ui.Prompt({
-          sessionID: props.session_id,
-          visible: props.visible,
-          disabled: props.disabled,
-          onSubmit: () => {
-            dismissed = ghost() || dismissed
-            submitted = true
-            clearGhost()
-            props.on_submit?.()
-          },
-          showPlaceholder: true,
-          placeholders: text ? { normal: [text] } : undefined,
-          ref: (ref) => {
-            promptRef = ref
-            props.ref?.(ref)
-          },
-        })
-      },
-    },
-  } as never)
-
-  api.command?.register?.(() => [
-    {
-      title: "Suggester: Settings & Status",
-      value: "suggester",
-      category: "Suggester",
-      description: "View status and configure prompt suggester",
-      slash: { name: "suggester" },
-      onSelect: async () => {
-        const root = roots[0]
-        if (!root) return
-        const cfg = await loadConfig(root)
-        const live = await findLive(roots, sessionID())
-        const seed = await loadSeed(root)
-        api.ui.toast({
-          variant: "info",
-          title: "Suggester Status",
-          message: `Enabled: ${cfg.enabled} | Model: ${cfg.inference.suggesterModel} | Seed: ${seed ? "ready" : "none"} | Current: ${live?.text || "(none)"}`,
-        })
-      },
-    },
-    {
-      title: "Suggester: Enable",
-      value: "suggester.on",
-      category: "Suggester",
-      description: "Enable prompt suggestions",
-      slash: { name: "suggester on", aliases: ["suggester:on"] },
-      onSelect: async () => {
-        const root = roots[0]
-        if (root) await saveConfig(root, "project", { enabled: true })
-        api.ui.toast({ variant: "success", message: "Prompt suggester enabled" })
-        void refresh()
-      },
-    },
-    {
-      title: "Suggester: Disable",
-      value: "suggester.off",
-      category: "Suggester",
-      description: "Disable prompt suggestions",
-      slash: { name: "suggester off", aliases: ["suggester:off"] },
-      onSelect: async () => {
-        const root = roots[0]
-        if (root) await saveConfig(root, "project", { enabled: false })
-        clearGhost()
-        api.ui.toast({ variant: "info", message: "Prompt suggester disabled" })
-      },
-    },
-    {
-      title: "Suggester: Reseed Project Intent",
-      value: "suggester.reseed",
-      category: "Suggester",
-      description: "Trigger fresh intent re-seeding",
-      slash: { name: "suggester reseed", aliases: ["suggester:reseed"] },
-      onSelect: async () => {
-        const root = roots[0]
-        if (root) {
-          const { unlink } = await import("node:fs/promises")
-          const { seedPath } = await import("./infra/paths.ts")
-          await unlink(seedPath(root)).catch(() => undefined)
+    async function command(input?: string) {
+      const target = current()
+      if (!target) {
+        context.ui.toast.show({ message: "Open a root session first.", variant: "info" })
+        return
+      }
+      const options = { location: target.location, signal: controller.signal }
+      const action = (input ?? "").trim().toLowerCase()
+      const resume = client.suspend(target)
+      try {
+        if (action === "on" || action === "off") {
+          await rpc.configure({ sessionID: target.sessionID, enabled: action === "on" }, options)
+          if (controller.signal.aborted) return
+          context.ui.toast.show({ message: action === "on" ? "Suggestions enabled." : "Suggestions disabled.", variant: "success" })
+        } else if (action === "reseed") {
+          await rpc.reseed({ sessionID: target.sessionID }, options)
+          if (controller.signal.aborted) return
+          context.ui.toast.show({ message: "Project intent cache cleared. Automatic reseeding follows your configuration.", variant: "info" })
+        } else if (action === "refresh") {
+          await rpc.refresh({ sessionID: target.sessionID }, options)
+        } else {
+          const status = await rpc.status({ sessionID: target.sessionID }, options) as SuggesterStatus
+          if (controller.signal.aborted) return
+          context.ui.toast.show({
+            title: "Prompt suggester",
+            message: `Enabled: ${status.enabled} | Model: ${status.suggesterModel} | Seed: ${status.seedReady ? "ready" : "none"} | Current: ${status.suggestion || "(none)"}`,
+            variant: "info",
+          })
         }
-        api.ui.toast({ variant: "info", message: "Project intent seed reset; will reseed next turn." })
-      },
-    },
-  ])
+      } catch {
+        if (!controller.signal.aborted) context.ui.toast.show({ message: "Could not contact the prompt suggester.", variant: "error" })
+      } finally {
+        resume()
+      }
+    }
 
-  void refresh()
-}
+    const removeSlot = context.ui.slot({
+      append: "session.composer.top",
+      render: (input) => (
+        <Show when={ghost()?.suggestion && input.sessionID === ghost()?.sessionID}>
+          <box flexDirection="row" gap={1} paddingLeft={2} paddingRight={2}>
+            <text fg={context.theme.text.faint}>↳</text>
+            <text fg={context.theme.text.muted}>{ghost()?.suggestion}</text>
+            <text fg={context.theme.text.faint}>{prompt ? "ctrl+alt+n · ctrl+alt+x" : "prompt API patch required"}</text>
+          </box>
+        </Show>
+      ),
+    })
 
-async function findLive(roots: string[], sessionID?: string): Promise<LiveSuggestion | null> {
-  for (const root of roots) {
-    const live = await loadLive(root, sessionID)
-    if (live) return live
-  }
-  if (!sessionID) return null
-  const projects = await readdir(path.join(stateRoot(), "projects")).catch(() => [])
-  for (const project of projects) {
-    const live = await readJson<LiveSuggestion>(
-      path.join(stateRoot(), "projects", project, "sessions", sessionID, "live.json"),
-    )
-    if (live) return live
-  }
-  return null
-}
+    context.keymap.layer(() => ({
+      mode: "global",
+      commands: [{
+        id: "suggester.command",
+        title: "Suggester: Settings & Status",
+        palette: true,
+        slash: { name: "suggester", arguments: true },
+        run: command,
+      }],
+    }))
 
-export default {
-  id: PLUGIN_ID,
-  tui,
-} satisfies TuiPluginModule
+    // Use the host's base input mode and check focus again when dispatching a key.
+    context.keymap.layer(() => {
+      const suggestion = ghost()
+      const available = () => Boolean(client.visible()) && (!prompt || prompt.focused())
+      const insertable = () => available() && Boolean(prompt?.isEmpty())
+      return {
+        priority: 100,
+        commands: [
+          { id: "suggester.accept", title: "Submit suggested next prompt", bind: "ctrl+alt+n", enabled: available, run: () => accept(true) },
+          { id: "suggester.dismiss", title: "Dismiss suggested next prompt", bind: "ctrl+alt+x", enabled: available, run: dismiss },
+          ...(prompt ? [
+            { id: "suggester.insert-space", title: "Insert suggested next prompt", bind: "space", enabled: () => insertable() && Boolean(suggestion?.ghostAcceptKeys.includes("space")), run: () => accept(false) },
+            { id: "suggester.insert-right", title: "Insert suggested next prompt", bind: "right", enabled: () => insertable() && Boolean(suggestion?.ghostAcceptKeys.includes("right")), run: () => accept(false) },
+            { id: "suggester.dismiss-backspace", title: "Dismiss suggested next prompt", bind: "backspace", enabled: insertable, run: dismiss },
+          ] : []),
+        ],
+      }
+    })
+
+    const refresh = () => void client.refresh()
+    const offStarted = context.data.on("session.execution.started", (event) => {
+      if (event.data.sessionID === current()?.sessionID) client.invalidate()
+    })
+    const offSucceeded = context.data.on("session.execution.succeeded", refresh)
+    const offFailed = context.data.on("session.execution.failed", refresh)
+    const offInterrupted = context.data.on("session.execution.interrupted", refresh)
+    const timer = setInterval(refresh, 500)
+    createEffect(refresh)
+
+    return () => {
+      controller.abort()
+      clearInterval(timer)
+      client.dispose()
+      offStarted()
+      offSucceeded()
+      offFailed()
+      offInterrupted()
+      removeSlot()
+    }
+  },
+})

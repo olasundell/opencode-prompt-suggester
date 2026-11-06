@@ -2,6 +2,27 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased] - V2 upgrade
+
+### Changed
+- Port server and TUI entries to the OpenCode V2 plugin API.
+- Generate suggestions without hidden sessions or conversation-history writes.
+- Preserve worktree-root state and existing configuration, intent and steering formats.
+- Run inference independently of event handling, with cancellation and serialised
+  state mutations to prevent superseded results from reappearing.
+- Pass execution outcomes directly into the recovery suggestion logic.
+- Route terminal and Desktop state/configuration requests through session-scoped RPC.
+- Keep disabled suggestions hidden and clear the current suggestion when disabling.
+- Describe cache invalidation and automatic reseeding accurately.
+
+### Added
+- Desktop composer pill with safe Tab insertion, native Enter submission and Escape dismissal.
+- Optional TUI prompt API patch for safe insertion and submission.
+- Behavioural tests for lifecycle races, RPC routing and UI acceptance guards.
+- CI typecheck, tests, build and committed Desktop bundle verification.
+
+---
+
 ## [v0.1.3] - 2026-08-21
 
 ### Fixed
